@@ -1,13 +1,26 @@
+import io
 import json
 import logging
 import os
 import urllib.parse
 import azure.functions as func
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobClient
+import psycopg2
 
 app = func.FunctionApp()
 
 QUEUE_NAME = os.getenv("STORAGE_QUEUE_NAME", "file-ingestion-queue")
 CONNECTION_SETTING = "AzureWebJobsStorage"
+
+# PostgreSQL connection parameters
+PG_HOST = os.getenv("PG_HOST")
+PG_PORT = os.getenv("PG_PORT", "5432")
+PG_DATABASE = os.getenv("PG_DATABASE", "analyticsdb")
+PG_USER = os.getenv("PG_USER")
+PG_PASSWORD = os.getenv("PG_PASSWORD")
+PG_SSLMODE = os.getenv("PG_SSLMODE", "require")
+TARGET_TABLE = os.getenv("TARGET_TABLE", "analytics_landing")
 
 
 @app.queue_trigger(
@@ -45,7 +58,6 @@ def process_storage_event(msg: func.QueueMessage) -> None:
             logging.warning("Event received without 'data.url'. Skipping.")
             return
 
-        # Decode URL to handle escaped characters, spaces, or query parameters
         blob_url = urllib.parse.unquote(raw_blob_url.split("?")[0])
         content_length = data.get("contentLength", 0)
         content_type = data.get("contentType", "unknown")
@@ -54,49 +66,82 @@ def process_storage_event(msg: func.QueueMessage) -> None:
             f"File detected: {blob_url} | Size: {content_length} bytes | Type: {content_type}"
         )
 
-        # Execute target analytics database ingestion
-        ingest_file_to_analytics_db(blob_url=blob_url, file_size=content_length)
+        # Ingest file into PostgreSQL
+        ingest_file_to_postgresql(blob_url=blob_url, file_size=content_length)
 
-        logging.info(f"Ingestion completed successfully for: {blob_url}")
+        logging.info(f"PostgreSQL ingestion completed successfully for: {blob_url}")
 
     except Exception as exc:
         logging.error(f"Error processing message {msg_id}: {str(exc)}", exc_info=True)
-        # Raising an exception signals Azure Functions to keep the message for retry.
-        # After reaching maxDequeueCount (default 5 in host.json), it automatically
-        # moves to the poison queue (<queue_name>-poison).
+        # Re-raise to trigger Azure Functions retry (up to maxDequeueCount)
         raise exc
 
 
-def ingest_file_to_analytics_db(blob_url: str, file_size: int) -> None:
+def get_postgres_connection():
+    """Establish and return connection to Azure Database for PostgreSQL Flexible Server."""
+    return psycopg2.connect(
+        host=PG_HOST,
+        port=PG_PORT,
+        dbname=PG_DATABASE,
+        user=PG_USER,
+        password=PG_PASSWORD,
+        sslmode=PG_SSLMODE
+    )
+
+
+def ingest_file_to_postgresql(blob_url: str, file_size: int) -> None:
     """
-    Triggers the data load into the target analytics database.
-    
-    BEST PRACTICE:
-    Use native database bulk load (e.g. COPY INTO) so compute happens inside the
-    database engine in parallel without pulling massive files through Function memory.
+    Streams file directly from Azure Blob Storage into PostgreSQL table
+    using PostgreSQL's high-speed native COPY command.
     """
-    logging.info(f"Triggering database bulk ingestion for: {blob_url}")
+    logging.info(f"Starting PostgreSQL bulk ingestion for: {blob_url}")
 
-    # --- Scenario 1: Azure Synapse Analytics / Azure SQL / Microsoft Fabric ---
-    # Example T-SQL execution:
-    # sql_query = f"""
-    # COPY INTO dbo.staging_landing
-    # FROM '{blob_url}'
-    # WITH (
-    #     FILE_TYPE = 'PARQUET',
-    #     CREDENTIAL = (IDENTITY = 'Managed Identity'),
-    #     AUTO_CREATE_TABLE = 'OFF'
-    # );
-    # """
+    # Initialize Blob client using Managed Identity or storage connection
+    storage_connection_str = os.getenv("AzureWebJobsStorage")
+    if storage_connection_str and "UseDevelopmentStorage" not in storage_connection_str:
+        blob_client = BlobClient.from_blob_url(blob_url, credential=None)
+    else:
+        # Falls back to DefaultAzureCredential (Managed Identity / Azure CLI auth)
+        blob_client = BlobClient.from_blob_url(blob_url, credential=DefaultAzureCredential())
 
-    # --- Scenario 2: Snowflake (if triggered programmatically) ---
-    # sql_query = f"""
-    # COPY INTO my_table
-    # FROM '@my_azure_stage/{os.path.basename(blob_url)}'
-    # FILE_FORMAT = (TYPE = 'PARQUET');
-    # """
+    file_extension = os.path.splitext(blob_url)[1].lower()
 
-    # --- Scenario 3: PostgreSQL / ClickHouse / BigQuery ---
-    # Stream or issue client command to load from storage.
+    with get_postgres_connection() as conn:
+        with conn.cursor() as cursor:
+            if file_extension in [".csv", ".txt"]:
+                # High-speed stream: Stream CSV directly into Postgres via COPY FROM STDIN
+                logging.info(f"Streaming CSV blob directly into PostgreSQL table: {TARGET_TABLE}")
+                blob_stream = blob_client.download_blob().chunks()
 
-    pass
+                # Using string buffer / generator for copy_expert
+                copy_sql = f"COPY {TARGET_TABLE} FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ',');"
+                
+                # Download blob stream into in-memory stream for fast loading
+                blob_data = blob_client.download_blob().readall()
+                csv_buffer = io.StringIO(blob_data.decode("utf-8"))
+                cursor.copy_expert(sql=copy_sql, file=csv_buffer)
+
+            elif file_extension in [".parquet"]:
+                # Parquet file ingestion using pyarrow
+                logging.info(f"Parsing Parquet blob and ingesting into PostgreSQL table: {TARGET_TABLE}")
+                import pyarrow.parquet as pq
+
+                blob_data = blob_client.download_blob().readall()
+                parquet_buffer = io.BytesIO(blob_data)
+                table = pq.read_table(parquet_buffer)
+                df = table.to_pandas()
+
+                # Convert DataFrame to in-memory CSV buffer for native COPY
+                csv_buffer = io.StringIO()
+                df.to_csv(csv_buffer, index=False, header=False)
+                csv_buffer.seek(0)
+
+                cursor.copy_expert(
+                    sql=f"COPY {TARGET_TABLE} FROM STDIN WITH (FORMAT csv, HEADER false, DELIMITER ',');",
+                    file=csv_buffer
+                )
+            else:
+                raise ValueError(f"Unsupported file format for ingestion: {file_extension}")
+
+            conn.commit()
+            logging.info(f"Data committed to PostgreSQL table '{TARGET_TABLE}'.")

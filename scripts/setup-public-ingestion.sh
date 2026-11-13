@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Phase 1: Setup Public Ingestion Architecture
+# Phase 1: Setup Public Ingestion Architecture with PostgreSQL Analytics DB
 RESOURCE_GROUP="${1:-rg-data-ingestion}"
 LOCATION="${2:-eastus}"
 STORAGE_ACCOUNT="${3:-stdataingest$RANDOM}"
 CONTAINER_NAME="${4:-raw-landing}"
 QUEUE_NAME="${5:-file-ingestion-queue}"
 SUBSCRIPTION_NAME="${6:-sub-blob-to-queue}"
+POSTGRES_SERVER="${7:-pg-analytics-$RANDOM}"
+POSTGRES_USER="${8:-pgadmin}"
+POSTGRES_PASSWORD="${9:-SecurePassword123!}"
 
-echo "=== Phase 1: Setting up Event-Driven Storage Ingestion (Public Mode) ==="
+echo "=== Phase 1: Setting up Event-Driven Storage Ingestion into PostgreSQL (Public Mode) ==="
 
 # 1. Create Resource Group
 echo "Creating Resource Group '$RESOURCE_GROUP'..."
@@ -52,7 +55,30 @@ az eventgrid event-subscription create \
     --included-event-types Microsoft.Storage.BlobCreated \
     --subject-begins-with "/blobServices/default/containers/$CONTAINER_NAME/blobs/"
 
-echo "Setup Complete!"
+# 6. Create Azure Database for PostgreSQL Flexible Server (Burstable tier for cost efficiency)
+echo "Creating Azure Database for PostgreSQL Flexible Server '$POSTGRES_SERVER'..."
+az postgres flexible-server create \
+    --resource-group "$RESOURCE_GROUP" \
+    --name "$POSTGRES_SERVER" \
+    --location "$LOCATION" \
+    --admin-user "$POSTGRES_USER" \
+    --admin-password "$POSTGRES_PASSWORD" \
+    --sku-name Standard_B1ms \
+    --tier Burstable \
+    --storage-size 32 \
+    --public-access "0.0.0.0" \
+    --yes
+
+# 7. Create Analytics Database inside PostgreSQL
+echo "Creating database 'analyticsdb' in PostgreSQL..."
+az postgres flexible-server db create \
+    --resource-group "$RESOURCE_GROUP" \
+    --server-name "$POSTGRES_SERVER" \
+    --database-name "analyticsdb"
+
+echo "=== Phase 1 Setup Complete! ==="
 echo "Storage Account: $STORAGE_ACCOUNT"
-echo "Container: $CONTAINER_NAME"
-echo "Queue: $QUEUE_NAME"
+echo "Container:       $CONTAINER_NAME"
+echo "Queue:           $QUEUE_NAME"
+echo "PostgreSQL Host: $POSTGRES_SERVER.postgres.database.azure.com"
+echo "Database Name:   analyticsdb"

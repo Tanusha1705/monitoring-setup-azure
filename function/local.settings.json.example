@@ -4,6 +4,12 @@
     "AzureWebJobsStorage": "<your_azure_storage_connection_string>",
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "STORAGE_QUEUE_NAME": "file-ingestion-queue",
-    "ANALYTICS_DB_CONNECTION_STRING": "<your_database_connection_string_or_endpoint>"
+    "PG_HOST": "<your-postgres-server>.postgres.database.azure.com",
+    "PG_PORT": "5432",
+    "PG_DATABASE": "analyticsdb",
+    "PG_USER": "<your_admin_user>",
+    "PG_PASSWORD": "<your_password>",
+    "PG_SSLMODE": "require",
+    "TARGET_TABLE": "analytics_landing"
   }
 }

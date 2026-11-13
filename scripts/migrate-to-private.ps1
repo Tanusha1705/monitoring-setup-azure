@@ -1,14 +1,15 @@
-# Phase 2: Migrate Storage & Function Ingestion to Private Architecture
+# Phase 2: Migrate Storage, Function, and PostgreSQL to Private Architecture
 param(
     [string]$ResourceGroupName = "rg-data-ingestion",
     [string]$Location = "eastus",
     [string]$StorageAccountName = "stdataingest1234",
+    [string]$PostgresServerName = "pg-analytics-1234",
     [string]$VNetName = "vnet-ingestion",
     [string]$FunctionSubnetName = "snet-function",
     [string]$EndpointSubnetName = "snet-private-endpoints"
 )
 
-Write-Host "=== Phase 2: Transitioning Storage Account to Private Endpoints & VNet ===" -ForegroundColor Cyan
+Write-Host "=== Phase 2: Transitioning Storage Account & PostgreSQL to Private Endpoints & VNet ===" -ForegroundColor Cyan
 
 # 1. Create Virtual Network
 Write-Host "Creating Virtual Network '$VNetName'..."
@@ -59,10 +60,23 @@ az network private-endpoint create `
     --group-id queue `
     --connection-name "conn-queue"
 
-# 6. Configure Private DNS Zones for Blob and Queue
+# 6. Create Private Endpoint for PostgreSQL Flexible Server (if supported in region)
+$postgresId = az postgres flexible-server show --name $PostgresServerName --resource-group $ResourceGroupName --query id --output tsv
+Write-Host "Creating Private Endpoint for PostgreSQL Flexible Server..."
+az network private-endpoint create `
+    --name "pe-$PostgresServerName" `
+    --resource-group $ResourceGroupName `
+    --vnet-name $VNetName `
+    --subnet $EndpointSubnetName `
+    --private-connection-resource-id $postgresId `
+    --group-id postgresqlServer `
+    --connection-name "conn-postgres"
+
+# 7. Configure Private DNS Zones for Blob, Queue, and PostgreSQL
 Write-Host "Configuring Private DNS Zones..."
 az network private-dns zone create --resource-group $ResourceGroupName --name "privatelink.blob.core.windows.net"
 az network private-dns zone create --resource-group $ResourceGroupName --name "privatelink.queue.core.windows.net"
+az network private-dns zone create --resource-group $ResourceGroupName --name "privatelink.postgres.database.azure.com"
 
 az network private-dns link vnet create `
     --resource-group $ResourceGroupName `
@@ -78,10 +92,23 @@ az network private-dns link vnet create `
     --virtual-network $VNetName `
     --registration-enabled false
 
-# 7. Disable Public Network Access on Storage Account
+az network private-dns link vnet create `
+    --resource-group $ResourceGroupName `
+    --zone-name "privatelink.postgres.database.azure.com" `
+    --name "link-postgres-$VNetName" `
+    --virtual-network $VNetName `
+    --registration-enabled false
+
+# 8. Disable Public Network Access on Storage and PostgreSQL
 Write-Host "Locking down Storage Account: Disabling Public Network Access..." -ForegroundColor Yellow
 az storage account update `
     --name $StorageAccountName `
+    --resource-group $ResourceGroupName `
+    --public-network-access Disabled
+
+Write-Host "Locking down PostgreSQL: Disabling Public Access..." -ForegroundColor Yellow
+az postgres flexible-server update `
+    --name $PostgresServerName `
     --resource-group $ResourceGroupName `
     --public-network-access Disabled
 
