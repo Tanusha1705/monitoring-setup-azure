@@ -1,0 +1,9 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "<your_azure_storage_connection_string>",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "STORAGE_QUEUE_NAME": "file-ingestion-queue",
+    "ANALYTICS_DB_CONNECTION_STRING": "<your_database_connection_string_or_endpoint>"
+  }
+}
